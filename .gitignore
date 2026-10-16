@@ -1,0 +1,5 @@
+node_modules/
+# generated on first start; the private key must never be shared
+tls-key.pem
+tls-cert.pem
+password.txt

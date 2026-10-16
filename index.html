@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LAN Remote</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #screen { display: block; width: 100vw; height: 100vh; object-fit: contain; cursor: none; outline: none; }
+  #msg { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+         color: #9c9a92; font: 15px system-ui, sans-serif; pointer-events: none; }
+  #login { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+           justify-content: center; gap: 12px; background: #000; font: 15px system-ui, sans-serif; }
+  #msg[hidden], #login[hidden] { display: none; }
+  #login h1 { margin: 0 0 4px; color: #d8d6cf; font-size: 18px; font-weight: 600; }
+  #login input, #login button { width: 240px; box-sizing: border-box; padding: 10px 12px;
+           border-radius: 6px; font: inherit; }
+  #login input { border: 1px solid #3a3935; background: #151513; color: #eceae4; }
+  #login input:focus { outline: none; border-color: #8a887f; }
+  #login button { border: 0; background: #d8d6cf; color: #111; font-weight: 600; cursor: pointer; }
+  #login button:disabled { opacity: .5; cursor: default; }
+  #err { min-height: 1.2em; color: #e0786a; font-size: 13px; }
+</style>
+</head>
+<body>
+<canvas id="screen" tabindex="0"></canvas>
+<div id="msg" hidden>Connecting… click the screen to capture mouse &amp; keyboard.</div>
+<form id="login">
+  <h1>LAN Remote</h1>
+  <input id="pw" type="password" autocomplete="current-password" placeholder="Password" required autofocus />
+  <button id="go">Connect</button>
+  <div id="err"></div>
+</form>
+<script>
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d", { alpha: false });
+const msg = document.getElementById("msg");
+const login = document.getElementById("login"), pw = document.getElementById("pw");
+const go = document.getElementById("go"), err = document.getElementById("err");
+
+let ws = null, authed = false, decoder = null, gotKey = false, ts = 0;
+const FRAME_US = Math.round(1e6 / 60);
+
+async function pickConfig() {
+  if (!window.VideoDecoder) return null;
+  for (const codec of ["avc1.42E01F", "avc1.42E02A", "avc1.4D4029", "avc1.640029"]) {
+    const c = { codec, optimizeForLatency: true };
+    if ((await VideoDecoder.isConfigSupported(c)).supported) return c;
+  }
+  return null;
+}
+const cfgReady = pickConfig();
+
+function newDecoder(cfg) {
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+      msg.hidden = true;
+    },
+    // A decode error closes the decoder: rebuild it and resume at the next keyframe.
+    error: (e) => { console.error(e); gotKey = false; newDecoder(cfg); },
+  });
+  decoder.configure(cfg);
+}
+
+function showLogin(text) {
+  login.hidden = false; msg.hidden = true; go.disabled = false;
+  err.textContent = text; pw.select(); pw.focus();
+}
+
+function connect(password) {
+  ws = new WebSocket(`wss://${location.host}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => ws.send(JSON.stringify({ t: "auth", p: password }));
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {                  // "ok" = password accepted
+      authed = true; login.hidden = true; msg.hidden = false; canvas.focus();
+      return;
+    }
+    const data = new Uint8Array(ev.data);
+    const key = data[0] === 1;
+    if (!gotKey) { if (!key) return; gotKey = true; }      // wait for the first keyframe
+    decoder.decode(new EncodedVideoChunk({
+      type: key ? "key" : "delta", timestamp: ts, data: data.subarray(1),
+    }));
+    ts += FRAME_US;
+  };
+  ws.onclose = (ev) => {
+    if (!authed) return showLogin(ev.code === 4001 ? "Wrong password." : "Can't reach the PC.");
+    authed = false;
+    msg.hidden = false; msg.textContent = "Disconnected. Reload to reconnect.";
+  };
+}
+
+login.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  go.disabled = true; err.textContent = "";
+  const cfg = await cfgReady;
+  if (!cfg) return showLogin("This browser can't decode the stream. Use Chrome or Edge.");
+  if (!decoder) newDecoder(cfg);   // ready before any frame arrives, so the cached picture isn't dropped
+  connect(pw.value);
+});
+
+// --- send input back to the main PC ---
+const send = (o) => { if (authed && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+let nx = 0, ny = 0, pendingMove = false;
+const heldKeys = new Set(), heldButtons = new Set();
+
+function rectToNorm(e) {
+  const r = canvas.getBoundingClientRect();
+  // account for object-fit: contain letterboxing
+  const scale = Math.min(r.width / canvas.width, r.height / canvas.height);
+  const vw = canvas.width * scale, vh = canvas.height * scale;
+  const ox = r.left + (r.width - vw) / 2, oy = r.top + (r.height - vh) / 2;
+  nx = Math.min(1, Math.max(0, (e.clientX - ox) / vw));
+  ny = Math.min(1, Math.max(0, (e.clientY - oy) / vh));
+}
+function flushMove() { if (pendingMove) { send({ t: "m", x: nx, y: ny }); pendingMove = false; } }
+
+canvas.addEventListener("mousemove", (e) => { rectToNorm(e); pendingMove = true; });
+canvas.addEventListener("mousedown", (e) => {
+  canvas.focus(); rectToNorm(e); pendingMove = true; flushMove();   // click exactly where the pointer is
+  heldButtons.add(e.button); send({ t: "d", b: e.button });
+});
+window.addEventListener("mouseup", (e) => {
+  if (!heldButtons.delete(e.button)) return;
+  flushMove(); send({ t: "u", b: e.button });
+});
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); flushMove(); send({ t: "w", dy: e.deltaY }); }, { passive: false });
+canvas.addEventListener("keydown", (e) => { e.preventDefault(); heldKeys.add(e.code); send({ t: "k", k: e.code, down: true }); });
+canvas.addEventListener("keyup", (e) => { e.preventDefault(); heldKeys.delete(e.code); send({ t: "k", k: e.code, down: false }); });
+// Switching away (Alt+Tab on the laptop) must not leave keys or buttons stuck down.
+window.addEventListener("blur", () => {
+  for (const k of heldKeys) send({ t: "k", k, down: false });
+  for (const b of heldButtons) send({ t: "u", b });
+  heldKeys.clear(); heldButtons.clear();
+});
+
+function pump() { flushMove(); requestAnimationFrame(pump); }
+requestAnimationFrame(pump);
+</script>
+</body>
+</html>

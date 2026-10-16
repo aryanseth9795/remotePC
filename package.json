@@ -1,0 +1,15 @@
+{
+  "name": "lan-remote",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Minimal LAN-only remote desktop: ffmpeg capture -> WebSocket -> browser WebCodecs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.0"
+  }
+}
